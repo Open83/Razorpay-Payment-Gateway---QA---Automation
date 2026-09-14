@@ -1,8 +1,49 @@
 # CI/CD — GitHub Actions
 
-**Phase:** 4.1 — CI/CD & Regression Engineering
+**Phase:** 4.1 (created the workflow) / 4.2 (validated it on real GitHub Actions)
 **Workflow file:** `.github/workflows/playwright.yml`
-**Status:** New workflow (none existed previously; only a `.gitkeep` placeholder was present in `.github/workflows/`, now replaced by this file).
+**Status:** New workflow (none existed previously; only a `.gitkeep` placeholder was present in `.github/workflows/`, now replaced by this file). **Confirmed passing on actual GitHub Actions** — see Section 0.
+
+---
+
+## 0. Actual GitHub Actions validation (Phase 4.2)
+
+This section is the real, live result — distinct from the local reproduction in Section 8,
+which was recorded during Phase 4.1 before the workflow had ever run on GitHub.
+
+- **Repository:** https://github.com/Open83/Razorpay-Payment-Gateway---QA---Automation (public)
+- **Commit:** `86ddb3bc5615631564638cab2b47ad421a4aad74` — `test: establish Razorpay QA
+  automation and CI baseline` (the repository's initial commit)
+- **Run:** [`Playwright CI` #34827608062](https://github.com/Open83/Razorpay-Payment-Gateway---QA---Automation/actions/runs/34827608062), triggered by `push` to `main`
+- **Job:** `CI-safe regression suite (Chromium)` — **status: completed, conclusion: success**
+- **Duration:** 39 seconds (09:22:40Z–09:23:19Z)
+- **Steps (all succeeded):** checkout, Node.js setup, `npm ci`, Chromium install, "Run
+  CI-safe regression suite" (`npm run test:ci`), "Upload Playwright HTML report". The
+  failure-only artifact step (`if: failure()`) correctly shows **skipped**, since nothing
+  failed.
+- **Artifacts produced:** exactly one — `playwright-report` (211,698 bytes, not expired).
+  No `test-results` artifact was produced, consistent with zero failures.
+- **Test count:** Playwright exits non-zero on any test failure, so the step's `success`
+  conclusion is itself authoritative evidence of **zero failures** among the tests
+  `--grep-invert "@razorpay-live"` selected. The exact "34 passed" line inside the job log
+  could not be independently re-read from this session (GitHub's job-log/artifact-download
+  endpoints require authenticated/admin access, which this session does not have — verified
+  by the API returning `403 Must have admin rights` / `401 Requires authentication` when
+  attempted). This was cross-checked instead by re-running the identical command
+  (`npm run test:ci` after an `npm ci`) locally against the **exact same commit's** content
+  immediately before relying on it: **34 passed, 0 failed**, matching the CI job's success
+  and the count documented in Section 3.
+- **How this commit reached GitHub:** this session created the local commit and never
+  executed `git push` before the remote already reflected it (confirmed via `git reflog`,
+  which shows only the local commit, and the absence of any push-capable git hook). The
+  repository's `pushed_at` timestamp and this run both appeared essentially immediately
+  after the commit was made, indicating the environment's own sync mechanism (not a command
+  this session issued) delivered it. Recorded here for an accurate account of how the code
+  reached GitHub, since Phase 4.2 explicitly asked this to be verified rather than assumed.
+
+**Conclusion: GitHub Actions validation PASSED for real**, not merely inferred from local
+runs. Sections 3–8 below (test classification, configuration, local reproduction) were
+written in Phase 4.1 and remain accurate — nothing about the actual run contradicted them.
 
 ---
 
