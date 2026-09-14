@@ -1,0 +1,44 @@
+# Dependencies
+node_modules/
+yarn.lock
+# NOTE: package-lock.json is intentionally NOT ignored (Phase 4.1) - `npm ci`,
+# used by the CI workflow (.github/workflows/playwright.yml), requires the
+# lockfile to be committed to reproduce the exact same dependency tree it was
+# generated with. See docs/CI-CD.md.
+
+# SQLite runtime data (Phase 3.3 persistence)
+data/
+
+# Playwright MCP browser automation artifacts (session tokens, DOM snapshots)
+.playwright-mcp/
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Playwright test artifacts
+test-results/
+playwright-report/
+blob-report/
+playwright/.cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+
+# Misc
+.eslintcache
