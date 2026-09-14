@@ -1,6 +1,13 @@
 # Security Implementation Guide
 
-## Phase 2.1: Security Fixes
+**This document describes the security controls as they currently exist** (as of Phase
+3.3.1). The controls below were first introduced in Phase 2.1 and have since been
+extended with durable (SQLite) persistence and explicit state-machine guards (Phase
+3.3) — historical notes call out what changed and why. See "Security Defects Found &
+Resolved" below for the two genuine defects this project's own testing found in these
+controls, and `docs/DEFECTS.md` for the full, authoritative record of each.
+
+## Phase 2.1: Security Fixes (original introduction)
 
 This document describes the security enhancements implemented in Phase 2.1.
 
@@ -146,23 +153,24 @@ Each webhook has a unique **X-Razorpay-Event-Id** header. If the same event_id a
 
 ### Implementation
 
-**Code Location:** `src/routes/webhooks.js`
+**Code Location:** `src/routes/webhooks.js` + `src/orderStore.js` (`isWebhookEventProcessed()` / `recordWebhookEvent()`)
 
 ```javascript
-// Track processed event IDs
-const processedEventIds = new Set();
-
 // In webhook handler:
-if (processedEventIds.has(eventId)) {
+if (isWebhookEventProcessed(eventId)) {
   // Already processed, return success
-  return res.status(200).json({ success: true, note: 'Already processed' });
+  return res.status(200).json({ success: true, message: 'Webhook already processed' });
 }
 
-// Process webhook...
+// ...validate signature, process...
 
-// Mark as processed after successful processing
-processedEventIds.add(eventId);
+// Mark as processed after successful processing (durable - SQLite webhook_events table)
+recordWebhookEvent({ eventId, eventType: event, paymentId, orderId, amount, status, source: 'real' });
 ```
+**Historical note:** the original Phase 2.1 implementation used an in-memory `Set`,
+meaning processed event IDs were lost on every server restart. This was replaced with a
+durable SQLite table in Phase 3.3 — see the Limitations subsection below, updated to
+reflect that fix.
 
 **Idempotency Flow:**
 1. Webhook received with X-Razorpay-Event-Id
@@ -177,11 +185,16 @@ processedEventIds.add(eventId);
 - **Handles network retries:** Razorpay retries failed webhooks; duplicates are safe
 - **Simple but critical:** Solves a common source of bugs in payment integrations
 
-### Limitations
+### Limitations (current)
 
-- **In-memory storage:** Processed event IDs lost if server restarts
-- **Production needs database:** Real implementations should persist processed IDs to database
-- **Not durability guarantee:** This is acceptable for Phase 2 demo; Phase 3+ should add database
+- **Real Razorpay-originated webhook delivery not demonstrated:** the idempotency logic
+  above is deterministically tested with correctly-signed local requests using the real
+  webhook secret, but no webhook from Razorpay's own servers has been observed arriving
+  at this application — see `docs/DEFECTS.md` and the README's Webhook Limitation section.
+
+**Resolved (no longer a limitation):** durability across restarts — event IDs are now
+persisted in SQLite (`webhook_events` table), not an in-memory `Set`. Confirmed to
+survive both a clean restart and an actual process crash during Phase 3.3 testing.
 
 ### Testing
 
@@ -229,10 +242,12 @@ res.status(400).json({
 
 ```javascript
 function sanitizeRazorpayError(error, context) {
-  const fullMessage = error.message || '';
+  // The razorpay SDK doesn't always set a top-level `.message` (see DEF-001 in
+  // docs/DEFECTS.md) - fall back to `.error.description` so this never sees `undefined`.
+  const fullMessage = error.message || error.error?.description || '';
 
   // Log full error server-side for debugging
-  console.error(`[${context}] Razorpay error:`, fullMessage);
+  console.error(`[${context}] Razorpay error:`, fullMessage || '(no message provided by SDK)', '| statusCode:', error.statusCode);
 
   // Return safe client-facing message
   if (fullMessage.includes('payment not found')) {
@@ -246,6 +261,10 @@ function sanitizeRazorpayError(error, context) {
   return 'Operation failed. Please try again.';
 }
 ```
+**Historical note:** the `error.error?.description` fallback and the `error.statusCode`-based
+HTTP status derivation (used by the routes that call this function) were added in Phase
+3.3.1 as the fix for DEF-001 — the original version assumed `error.message` always
+existed, which crashed the server when it didn't. See `docs/DEFECTS.md`.
 
 ### Patterns Recognized
 
@@ -279,63 +298,73 @@ Verify that error responses:
 
 ### What is it?
 
-Local state tracking represents the payment lifecycle (created → paid → refunded) so the system knows the current status of each order.
+Local state tracking represents the payment lifecycle so the system knows the current
+status of each order, and so a webhook or repeated API call can't silently corrupt it.
 
 ### Order States
 
 ```
-created
-  ↓
-  ├→ paid (after successful payment verification)
-  │   ↓
-  │   └→ refunded (after refund webhook received)
-  │
-  └→ failed (after payment fails)
+created ──▶ authorized ──▶ paid ──▶ refunded
+   │                          ▲
+   └────────▶ paid ───────────┘
+   └────────▶ failed
+authorized ──▶ failed
 ```
+`failed` and `refunded` are terminal. A same-state transition (e.g. a replayed `/verify`
+call, or a duplicate webhook for an order already `paid`) is always allowed as a no-op.
 
 ### Implementation
 
-**Code Location:** `src/routes/payments.js`
+**Code Location:** `src/stateMachine.js` (`canTransition()`, the allow-list of legal
+transitions) + `src/orderStore.js` (`transitionOrder()`, the single guarded write path
+used by `/api/payments/verify`, `/api/refunds/create`, and `/api/webhooks/razorpay` alike)
 
-**Order Record:**
+**Order Record** (SQLite `orders` table via `src/db.js`):
 ```javascript
 {
   id: string,                          // Razorpay order_id
   amount: number,                      // Amount in paise
   currency: string,                    // 'INR'
-  status: 'created'|'paid'|'failed'|'refunded',
-  paymentId: string|null,              // null until payment verified
-  paymentStatus: string|null,          // 'captured', 'authorized', 'failed'
-  refundId: string|null,               // null until refund created
-  refundStatus: string|null,           // 'created', 'processed'
-  createdAt: Date,                     // When order was created
-  updatedAt: Date,                     // When last updated
+  status: 'created'|'authorized'|'paid'|'failed'|'refunded',
+  payment_id: string|null,              // null until payment verified
+  payment_status: string|null,          // 'captured', 'authorized', 'failed'
+  created_at: string,                   // ISO timestamp
+  updated_at: string,                   // ISO timestamp of last update
   receipt: string,                     // Unique receipt
 }
 ```
+Refunds live in a separate `refunds` table (supports multiple partial refunds per
+payment); webhook events in `webhook_events` (durable idempotency + audit log).
 
 **State Transitions:**
 
 | Event | Code Location | State Before | State After |
 |-------|---------------|--------------|-------------|
-| Order created | payments.js:70 | — | created |
-| Payment verified (captured) | payments.js:189 | created | paid |
-| Payment verified (authorized) | payments.js:189 | created | authorized |
-| Payment failed | webhook → Future | created | failed |
-| Refund created | webhook → Future | paid | refunded |
+| Order created | `payments.js` (`create-order`) | — | created |
+| Payment verified (captured) | `payments.js` (`/verify`) | created | paid |
+| Payment verified (authorized) | `payments.js` (`/verify`) | created | authorized |
+| Full refund created | `refunds.js` (`/refunds/create`) | paid | refunded |
+| Webhook `payment.authorized`/`captured`/`failed`/`refund.created` | `webhooks.js`, via `transitionOrder()` | (guarded by state machine) | per allow-list above |
 
 ### Why this matters
 
 - **Prevents state confusion:** System knows if order is paid, failed, or pending
-- **Supports QA scenarios:** Can test state transitions (paid → refunded)
-- **Prepares for webhooks:** When webhook processing is added, can update state from events
+- **Supports QA scenarios:** Replay/duplicate/idempotency tests all rely on this guard
+- **Protects against out-of-order events:** A late `payment.authorized` webhook arriving
+  after `payment.captured` already moved the order to `paid` is rejected by
+  `canTransition('paid', 'authorized')` rather than silently regressing the order
 - **Simple but complete:** Tracks essentials without overengineering
 
 ### Current Limitations
 
-- **Webhook events not yet processed:** Webhooks are logged but don't update state
-- **In-memory only:** State lost on server restart
-- **No state machine validation:** Could add state guards in Phase 3
+- **Real Razorpay-originated webhook delivery not demonstrated** — webhook-driven
+  transitions are implemented and deterministically tested, but not yet exercised by an
+  actual Razorpay-sent webhook (see `docs/DEFECTS.md`)
+
+**Resolved (no longer current limitations):** webhook events now do drive state
+transitions (previously logged only); state is now durable across restarts (SQLite, not
+in-memory); and state-machine validation now exists (`src/stateMachine.js`) — all three
+were introduced in Phase 3.3.
 
 ### Testing
 
@@ -364,15 +393,50 @@ created
 
 ---
 
-## Phase 3 Considerations
+## Security Defects Found & Resolved
 
-- **Persist webhook processed event IDs** to database for durability
-- **Update order state from webhooks** (payment.captured, payment.failed, refund.created)
-- **Add refund state tracking** to order record
-- **Test signature verification failures** in Phase 3 tests
-- **Test webhook idempotency** with duplicate events
-- **Test error message sanitization** to confirm no sensitive leakage
+Two genuine High-severity defects were discovered in these controls during testing,
+root-caused, fixed, and given dedicated regression tests. This section summarizes them;
+`docs/DEFECTS.md` is the authoritative, detailed record (reproduction steps, exact log
+evidence, suggested-vs-applied fix).
+
+### DEF-001 — Refund Error Handling Server Crash
+
+- **Severity:** High
+- **Symptom:** Any Razorpay-rejected refund request crashed the entire Node process,
+  taking down the whole application, not just that one request.
+- **Root cause:** `src/routes/refunds.js` (and identically, `src/routes/payments.js`)
+  derived the HTTP status code with `error.message.includes(...)`, but the `razorpay` SDK
+  throws error objects that don't set a top-level `.message` — the resulting `TypeError`
+  was uncaught inside the `catch` block itself.
+- **Fix:** Status code now derived from `error.statusCode`; `sanitizeRazorpayError()` (§4
+  above) falls back to `error.error?.description`.
+- **Regression coverage:** `tests/security/refund-error-handling.spec.js` (`REF-ERR-001`,
+  `REF-ERR-002`) — asserts both a controlled error response and that the server stays
+  alive and responsive immediately afterward.
+- **Status:** ✅ RESOLVED
+
+### DEF-002 — Webhook Raw-Body Middleware Ordering
+
+- **Severity:** High
+- **Symptom:** No correctly-signed webhook — real or locally simulated — could ever be
+  accepted; every request to `/api/webhooks/razorpay` returned `401`, regardless of how
+  correct its signature was.
+- **Root cause:** `src/app.js` mounted the global `express.json()` body parser before the
+  webhook router, so by the time the route's own `express.raw()` middleware ran, the body
+  had already been consumed and parsed — the HMAC was computed over the string
+  `"[object Object]"` instead of the real raw bytes.
+- **Fix:** The webhook router is now mounted *before* `express.json()` in `src/app.js` — a
+  pure reordering of two existing lines; `validateWebhookSignature()` itself was not
+  changed, weakened, or bypassed.
+- **Regression coverage:** `tests/security/webhook-validation.spec.js` (`WEB-001`,
+  `WEB-005`, `WEB-006`, `WEB-007`, and the dedicated `WEB-FIX-001..004`) — signature
+  acceptance, tamper rejection, and idempotency are all exercised deterministically.
+- **Status:** ✅ RESOLVED (at the deterministic/local level — real Razorpay-originated
+  delivery remains a separate, unresolved limitation; see §3's Limitations above)
 
 ---
 
-**Phase 2.1 Security Implementation Status: Complete**
+**Security Implementation Status:** Current as of Phase 3.3.1. Original controls introduced
+in Phase 2.1; persistence, state-machine guards, and the two defect fixes above were added
+in Phase 3.3/3.3.1. See `docs/DEFECTS.md` and `docs/PHASE-3.3.1-DEFECT-REMEDIATION-REPORT.md`.

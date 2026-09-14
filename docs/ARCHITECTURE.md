@@ -1,5 +1,11 @@
 # Application Architecture
 
+**This document describes the CURRENT architecture** (as of Phase 3.3/3.3.1 — real
+Razorpay Test Mode integration, SQLite persistence, and an explicit state machine). Where
+earlier design decisions were later superseded, that evolution is called out explicitly
+rather than erased, since it's part of this project's own QA history (see
+`docs/PHASE-3.3-TEST-REPORT.md` and `docs/DEFECTS.md` for how and why).
+
 ## Overview
 
 This is a minimal demo payment application designed to demonstrate QA engineering skills through comprehensive testing of Razorpay payment integration.
@@ -34,7 +40,9 @@ This is a minimal demo payment application designed to demonstrate QA engineerin
 │  └────────────────────────────────────────────────────┘  │
 │  ┌────────────────────────────────────────────────────┐  │
 │  │  Business Logic Layer                              │  │
-│  │  ├─ Order management (in-memory)                  │  │
+│  │  ├─ Order/refund/webhook-event persistence (SQLite│  │
+│  │  │  via src/db.js + src/orderStore.js)             │  │
+│  │  ├─ Payment/order state machine (src/stateMachine.js)│
 │  │  ├─ Payment verification                          │  │
 │  │  ├─ Refund processing                             │  │
 │  │  └─ Webhook signature validation (HMAC-SHA256)    │  │
@@ -97,11 +105,16 @@ Frontend receives Razorpay response
 ### 4. Webhook Event (Asynchronous)
 ```
 Razorpay sends webhook event to /api/webhooks/razorpay
-  → Backend validates signature (HMAC-SHA256)
-  → Backend parses event (payment.captured, refund.created, etc.)
-  → Backend logs event for testing
-  → Backend responds with HTTP 200 (quick acknowledgment)
+  → Backend validates signature over the RAW request body (HMAC-SHA256)
+  → Backend checks the event ID against durable (SQLite) idempotency records
+  → Backend parses event (payment.captured, payment.failed, refund.created, etc.)
+  → Backend drives the matching order through stateMachine.js's transitionOrder(),
+    which rejects out-of-order/contradictory transitions rather than applying them
+  → Backend persists the event (audit log) and responds with HTTP 200
 ```
+Note: real Razorpay-originated webhook delivery has not yet been demonstrated in this
+project (see `docs/DEFECTS.md` and the README's Webhook Limitation section) — the flow
+above is implemented and deterministically tested with correctly-signed local requests.
 
 ### 5. Refund (QA Testing)
 ```
@@ -156,11 +169,17 @@ User/QA clicks "Create Refund"
 - Invalid signatures are rejected immediately
 - **Why:** Ensures webhooks actually come from Razorpay, not attackers
 
-### 3. In-Memory Order Storage
-- Orders stored in JavaScript Map for demo
-- No database needed for proof-of-concept
-- **Limitation:** Orders lost on app restart
-- **Use Case:** Sufficient for QA testing, not production
+### 3. SQLite-Backed Persistence (evolved from an earlier in-memory design)
+- Orders, refunds, and webhook events are persisted in SQLite (`src/db.js`, using Node's
+  built-in `node:sqlite` — no external database package)
+- **Historical note:** the original Phase 2 design used plain in-memory `Map`/`Set`
+  objects, which meant orders and webhook idempotency records were lost on every restart.
+  This was replaced with SQLite in Phase 3.3 specifically to support restart safety,
+  durable webhook idempotency, and refund/audit history — see `docs/PHASE-3.3-TEST-REPORT.md`.
+- WAL mode + a busy-timeout pragma are set so the app process and a test process can both
+  safely access the same database file concurrently (see `docs/CI-CD.md`).
+- **Use case:** appropriately sized for this project — a single SQLite file, no server
+  process, no migrations tooling.
 
 ### 4. Separate Test & Production Configuration
 - All credentials in `.env` file (ignored by git)
@@ -174,22 +193,26 @@ User/QA clicks "Create Refund"
 - Razorpay Checkout handles payment UI (hosted)
 - **Why:** Focus is on QA testing, not UI/UX
 
-### 6. No Database
-- In-memory storage for demo purposes
-- No persistence across server restarts
-- **Future:** Database can be added if needed for testing scenarios
-- **Why:** Simplicity; current scope doesn't require it
+### 6. SQLite, Not a Database Server
+- Persistence uses Node's built-in `node:sqlite` module — a single file (`data/app.db`),
+  no separate database server or Docker container to run
+- **Why:** This project deliberately avoided adding infrastructure (no Postgres/Mongo/
+  Docker) while still getting genuine restart-safe persistence and durable idempotency —
+  see `docs/CI-CD.md` for how CI runs against this same file-based database with no
+  additional services
 
 ## Technology Stack
 
 | Layer | Technology | Version | Purpose |
 |-------|-----------|---------|---------|
-| Runtime | Node.js | v18+ | JavaScript runtime |
+| Runtime | Node.js | `>=22.5.0` | JavaScript runtime — required by `node:sqlite` |
 | Framework | Express.js | 4.18+ | HTTP server |
 | Payment API | Razorpay SDK | 2.9+ | Razorpay integration |
+| Persistence | `node:sqlite` (built-in) | — | Order/refund/webhook-event storage, no added dependency |
 | Configuration | dotenv | 16.3+ | Environment variables |
 | Frontend | Vanilla JS + Razorpay Checkout | — | UI and checkout |
 | Testing | Playwright Test | 1.40+ | QA automation |
+| CI/CD | GitHub Actions | — | `.github/workflows/playwright.yml` |
 
 ## Security Considerations
 
@@ -260,12 +283,13 @@ validation = expectedSignature === X-Razorpay-Signature header
 
 **Problem Solved:** Same webhook event could be processed multiple times if Razorpay retries
 
-**Implementation:** `src/routes/webhooks.js`
+**Implementation:** `src/routes/webhooks.js` + `src/orderStore.js`
 - Uses `X-Razorpay-Event-Id` header as unique event identifier
-- Tracks processed event IDs in in-memory Set
+- Tracks processed event IDs durably in the SQLite `webhook_events` table (survives a
+  server restart — this was in-memory only in the original Phase 2 design, see the
+  Persistence design decision above)
 - Duplicate events return HTTP 200 with "already processed" message
 - Different event IDs processed independently
-- In-memory storage only (Phase 2); production would use database
 
 **Deduplication Flow:**
 ```
@@ -293,69 +317,90 @@ validation = expectedSignature === X-Razorpay-Signature header
 
 ### Payment State Management
 
-**Order States:**
-```
-created    → Initial state when order created
-→ paid     → Transition after successful payment verification
-→ refunded → Transition after refund created
-Or:
-created    → failed → Final state after payment fails
-```
+**Implementation:** `src/stateMachine.js` (the allowed-transition rules) + `src/orderStore.js`
+(`transitionOrder()`, the single guarded write path every route uses — `/api/payments/verify`,
+`/api/refunds/create`, and `/api/webhooks/razorpay` alike).
 
-**Local Order Record** (in-memory Map):
+**States:** `created`, `authorized`, `paid`, `failed`, `refunded`
+
+**Valid transitions:**
+```
+created    → authorized
+created    → paid
+created    → failed
+authorized → paid
+authorized → failed
+paid       → refunded
+```
+`failed` and `refunded` are terminal (no outgoing transitions). A same-state "transition"
+(e.g. a replayed verification call, or a duplicate webhook for an order already `paid`) is
+always allowed as a no-op — this is what makes replay/duplicate handling safe rather than
+corrupting. Any transition not in the list above (e.g. a late `payment.authorized` webhook
+arriving after the order is already `paid`) is rejected by `canTransition()` rather than
+silently applied, so an out-of-order event cannot regress a further-along order.
+
+**Local Order Record** (SQLite `orders` table, via `src/db.js`):
 ```javascript
 {
   id: string,                    // Razorpay order ID
   amount: number,                // Amount in paise
   currency: string,              // 'INR'
-  status: 'created'|'paid'|'failed'|'refunded',
-  paymentId: string|null,        // Razorpay payment ID (after verification)
-  paymentStatus: string|null,    // 'captured', 'authorized', 'failed'
-  refundId: string|null,         // Razorpay refund ID
-  refundStatus: string|null,     // 'created', 'processed'
-  createdAt: Date,               // Order creation timestamp
-  updatedAt: Date,               // Last state update
+  status: 'created'|'authorized'|'paid'|'failed'|'refunded',
+  payment_id: string|null,        // Razorpay payment ID (after verification)
+  payment_status: string|null,    // 'captured', 'authorized', 'failed'
   receipt: string,               // Unique receipt number
+  created_at: string,             // ISO timestamp
+  updated_at: string,             // ISO timestamp of last state update
 }
 ```
+Refunds are tracked in a separate `refunds` table (one row per refund, supporting multiple
+partial refunds per payment), and webhook events in a `webhook_events` table (durable
+idempotency + audit log) — both also in `data/app.db`, via `src/orderStore.js`.
 
-**State Transitions:**
-- Order created → status = 'created'
-- Payment verified (captured) → status = 'paid', paymentStatus = 'captured'
-- Payment verified (authorized) → status = 'authorized', paymentStatus = 'authorized'
-- Webhook refund.created → status = 'refunded'
+**State Transitions (concrete triggers):**
+- Order created via `/api/payments/create-order` → `status = 'created'`
+- `/api/payments/verify` succeeds, payment `captured` → `status = 'paid'`, `payment_status = 'captured'`
+- `/api/payments/verify` succeeds, payment `authorized` → `status = 'authorized'`
+- `/api/refunds/create` succeeds with a full-amount refund → `status = 'refunded'`
+- A `payment.authorized`/`payment.captured`/`payment.failed`/`refund.created` webhook event,
+  once its signature is validated, drives the same `transitionOrder()` path
 
 ## Limitations & Future Improvements
 
 ### Current Limitations
-1. **In-memory storage only** — Orders and processed webhooks lost on restart
-2. **No database** — No persistent audit trail
-3. **No authentication** — Any user can verify any payment
-4. **Single product** — Fixed amount only (by design for demo)
-5. **Local testing only** — Webhooks need ngrok/tunnel for external testing
-6. **No idempotency guarantee** — Set-based deduplication lost on restart (would use database in production)
+1. **No authentication** — Any user can verify any payment (acceptable for this demo's scope; not a production posture)
+2. **Single product** — Fixed amount only (by design for demo)
+3. **Real Razorpay-originated webhook delivery not demonstrated** — a public tunnel was
+   confirmed reachable, but no webhook from Razorpay's own servers was observed arriving;
+   likely a Dashboard configuration gap outside this project's control (see `docs/DEFECTS.md`)
+4. **Real refund execution blocked** — a Razorpay Test Mode account/environment
+   restriction prevents an actual refund from completing, confirmed independently of this
+   app's code (see `docs/DEFECTS.md`)
+
+**Resolved since this document was first written (no longer current limitations):**
+in-memory-only storage, no persistent audit trail, no idempotency guarantee across
+restarts, and no state machine — all replaced by the SQLite persistence and
+`stateMachine.js` described above (Phase 3.3).
 
 ### Potential Improvements
-1. Add database (PostgreSQL, MongoDB)
-2. Add user authentication & authorization
-3. Add admin dashboard for order/refund management
-4. Support multiple products/amounts
-5. Persistent webhook event logging
-6. Payment state machine implementation
-7. Error tracking & alerting
+1. Add user authentication & authorization
+2. Add admin dashboard for order/refund management
+3. Support multiple products/amounts
+4. Error tracking & alerting
+5. Resolve the real-webhook-delivery and real-refund-execution blockers above
 
 ## Testing Scope
 
 This architecture supports testing:
-- ✅ Payment checkout flow (UI)
-- ✅ Payment verification (API)
-- ✅ Refund creation (API)
-- ✅ Webhook receipt and validation
+- ✅ Payment checkout flow (UI) — including one genuine real Razorpay Test Mode Checkout payment
+- ✅ Payment verification (API) — against the real payment above
+- ✅ Refund creation (API) — request validation and error handling tested; real execution blocked (see Limitations)
+- ✅ Webhook receipt and validation — deterministically tested with real HMAC math; real Razorpay-originated delivery not demonstrated (see Limitations)
 - ✅ Payment amount validation
-- ✅ Business logic scenarios
+- ✅ Business logic scenarios (state machine transitions, replay protection, idempotency)
 - ✅ Error handling
 - ✅ Integration scenarios
 
 ---
 
-**Architecture Status:** Phase 2 Complete — Minimal demo application with all essential endpoints and webhook validation
+**Architecture Status:** Current as of Phase 3.3.1 (real Razorpay integration, SQLite persistence, state machine, two resolved defects — see `docs/DEFECTS.md`). CI/CD detail in `docs/CI-CD.md`.

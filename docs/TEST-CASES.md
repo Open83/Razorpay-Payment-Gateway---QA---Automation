@@ -501,11 +501,16 @@ current, actual state after Phase 3.3 (real Razorpay integration) and Phase 3.3.
 
 | Status | Count |
 |--------|-------|
-| ✅ Automated, PASSED (Chromium) | 37 |
+| ✅ Automated, PASSED (Chromium) — **total** | **37** |
+| ↳ of which: CI-safe (run automatically by GitHub Actions) | **34** |
+| ↳ of which: Razorpay-live (`SIG-001`, `REPLAY-001`, `UI-002` — manual only, `npm run test:razorpay`) | **3** |
 | ✅ Verified manually (real Razorpay Test Mode) | STATE-001, STATE-002, REF-002 |
 | 🔒 BLOCKED — Razorpay account/environment limitation (not a code defect) | Full/partial refund execution |
 | 🔒 BLOCKED — outside session access (Dashboard config) | Real Razorpay-originated webhook delivery |
-| **Automated executions, all passing** | **37/37** |
+
+This 37/34/3 split is confirmed directly via `npx playwright test --list` (and its
+`--grep`/`--grep-invert "@razorpay-live"` variants) and is consistent with
+`docs/CI-CD.md` and `docs/PHASE-3.3.1-DEFECT-REMEDIATION-REPORT.md`.
 
 **Defects found across Phase 3.3/3.3.1:** 2 (DEF-001, DEF-002), both **RESOLVED** and
 regression-tested — see `docs/DEFECTS.md`.

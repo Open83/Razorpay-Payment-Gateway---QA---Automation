@@ -2,18 +2,20 @@
 
 ## Prerequisites
 
-- **Node.js** v18 or higher (check: `node --version`)
+- **Node.js** `>=22.5.0` (check: `node --version`) — required by the built-in `node:sqlite`
+  module used for persistence (`src/db.js`); earlier Node versions do not have it
 - **npm** v9 or higher (check: `npm --version`)
 - **Git**
-- A modern browser (Chrome, Firefox, or Safari) — required for Playwright tests
+- A modern browser (Chromium is installed automatically by Playwright; Firefox/WebKit are
+  configured in `playwright.config.js` but not required for the default test run)
 
 ## Step-by-Step Setup
 
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/yourusername/razorpay-qa-automation.git
-cd razorpay-qa-automation
+git clone https://github.com/Open83/Razorpay-Payment-Gateway---QA---Automation.git
+cd Razorpay-Payment-Gateway---QA---Automation
 ```
 
 ### 2. Install Dependencies
@@ -21,25 +23,36 @@ cd razorpay-qa-automation
 ```bash
 npm install
 ```
+or, to install exactly what the committed lockfile specifies (what CI does):
+```bash
+npm ci
+```
 
-This installs:
-- `@playwright/test` — Test runner and browser automation framework
+This installs the app's runtime dependencies (`express`, `razorpay`, `dotenv`) and the
+`@playwright/test` dev dependency. Persistence uses Node's built-in `node:sqlite` — no
+separate database package is installed.
 
 **Verify installation:**
 ```bash
 npx playwright --version
 ```
 
-Expected output: `Version X.XX.X`
+### 3. Install Playwright Browsers
 
-### 3. Set Up Environment Variables
+```bash
+npx playwright install chromium
+```
+(Or `npx playwright install` for all three browsers, if you want to run the `firefox`/
+`webkit` projects manually — the default test scripts only use Chromium.)
+
+### 4. Set Up Environment Variables
 
 1. Copy the example environment file:
    ```bash
    cp .env.example .env
    ```
 
-2. Edit `.env` and add your Razorpay Test Mode credentials:
+2. Edit `.env` and add your own Razorpay Test Mode credentials:
    ```
    RAZORPAY_KEY_ID=rzp_test_XXXXXXXXXXXXX
    RAZORPAY_KEY_SECRET=your_test_secret_key_here
@@ -47,150 +60,107 @@ Expected output: `Version X.XX.X`
    APP_URL=http://localhost:3000
    NODE_ENV=test
    ```
+   - See [`docs/RAZORPAY-GUIDE.md`](docs/RAZORPAY-GUIDE.md) for how to obtain these and for
+     a verified-working Test Mode payment flow.
+   - Ensure you are in **TEST MODE** in your Razorpay dashboard.
+   - **Never commit `.env`** — it's already git-ignored.
 
-   **How to get these credentials:**
-   - Visit [RAZORPAY-GUIDE.md](docs/RAZORPAY-GUIDE.md) for detailed instructions
-   - Ensure you are in **TEST MODE** in your Razorpay dashboard
-   - Never commit `.env` to Git
+Without real credentials, the app still runs and most of the CI-safe test suite still
+passes (routes that need Razorpay return a sanitized `503`/error response instead) — see
+[`docs/CI-CD.md`](docs/CI-CD.md) for exactly which tests do and don't need real
+credentials.
 
-### 4. Verify Playwright Installation
+### 5. Persistence (SQLite)
 
-Download Playwright browsers:
-
-```bash
-npx playwright install
-```
-
-This may take a few minutes. Browsers are cached in `~/.cache/ms-playwright/`.
-
-### 5. Run Tests Locally
-
-#### Run all tests:
-```bash
-npm test
-```
-
-Expected output: Test results with pass/fail summary
-
-#### Run with interactive UI:
-```bash
-npm run test:ui
-```
-
-This opens the Playwright Test UI, allowing you to:
-- Run tests interactively
-- Inspect failures
-- View traces
-- Debug step-by-step
-
-#### Run in debug mode:
-```bash
-npm run test:debug
-```
-
-Launches a debugger where you can step through test code.
-
-#### View test report:
-```bash
-npm run test:report
-```
-
-Opens the HTML test report in your browser.
+The app persists orders, refunds, and webhook events to a local SQLite file. On first run,
+it automatically creates `data/app.db` (and its `-wal`/`-shm` companion files) — no manual
+database setup, migration step, or separate service is required. The `data/` directory is
+git-ignored; deleting it resets the app to a clean state.
 
 ### 6. Running the Application
 
-#### Automatic (via Playwright)
-The Playwright tests automatically start the Express app via `webServer` configuration in `playwright.config.js`.
-
-#### Manual Start
 ```bash
 npm start
 ```
-
-Or directly with Node.js:
+or directly:
 ```bash
 node src/app.js
 ```
-
-The app will start on `http://localhost:3000`.
+The app runs on `http://localhost:3000`.
 
 **Verify the app is running:**
 ```bash
+curl http://localhost:3000/health
 curl http://localhost:3000/api/payments/config
 ```
+The config endpoint returns only the public key ID (or `NOT_CONFIGURED`) and a
+`configured` boolean — never a secret.
 
-Expected response:
-```json
-{
-  "keyId": "rzp_test_XXXXXXXXXXXXX",
-  "currency": "INR",
-  "configured": true
-}
-```
+**In a browser:** open `http://localhost:3000` to see the demo checkout page. Completing
+an actual payment requires valid Razorpay Test Mode credentials in `.env`.
 
-**Access the demo app in browser:**
-- Open http://localhost:3000 in your browser
-- You should see the payment form with product details
-- Requires valid Razorpay credentials in `.env` to complete payments
+### 7. Running Tests
 
-**Health check:**
 ```bash
-curl http://localhost:3000/health
+npm run test:ci        # 34 CI-safe tests — what GitHub Actions runs, no real Razorpay account needed
+npm run test:razorpay  # 3 Razorpay-live tests — needs your own real .env credentials
+npm test                 # all 37 tests, against whatever .env currently has
+npm run test:ui        # interactive Playwright UI
+npm run test:debug     # step-through debugger
+npm run test:report    # view the last HTML report
 ```
 
-Expected response:
-```json
-{
-  "status": "ok",
-  "timestamp": "2024-01-15T10:30:45.123Z",
-  "environment": "development"
-}
-```
+`test:ci` and `test:razorpay` both restrict to the Chromium project
+(`--project=chromium`) and split the suite via Playwright's `--grep`/`--grep-invert` on
+the `@razorpay-live` tag — see [`docs/CI-CD.md`](docs/CI-CD.md) for exactly which 3 tests
+that tag covers and why.
+
+The Playwright tests automatically start the Express app via the `webServer` setting in
+`playwright.config.js` — you don't need to start it manually before running tests.
 
 ## Troubleshooting
 
 ### "Command not found: npm"
-- Install Node.js from https://nodejs.org/ (v18+)
+- Install Node.js `>=22.5.0` from https://nodejs.org/
 - Restart your terminal/shell
+
+### `node:sqlite` errors / app won't start
+- Check your Node version: `node --version` — this project requires `>=22.5.0`.
+  Older versions (including v18/v20) do not have the built-in `node:sqlite` module this
+  app's persistence layer depends on.
 
 ### Playwright browsers not found
 ```bash
-npx playwright install
+npx playwright install chromium
 ```
 
 ### Tests timeout or can't reach localhost:3000
 - Ensure the app is running: `node src/app.js`
-- Check that port 3000 is not in use: `lsof -i :3000` (macOS/Linux) or `netstat -ano | findstr :3000` (Windows)
+- Check that port 3000 is not already in use: `netstat -ano | findstr :3000` (Windows) or
+  `lsof -i :3000` (macOS/Linux)
 
-### .env file not loaded
-- Ensure `.env` file is in the project root directory
+### `.env` file not loaded
+- Ensure `.env` is in the project root
 - Restart your terminal after creating/modifying `.env`
-- Verify variables are readable: `cat .env` (should not error)
 
-### Playwright test fails with connection errors
-- Ensure Razorpay Test Mode credentials are correct in `.env`
-- Check your internet connection (tests call Razorpay API)
-- Verify `APP_URL` matches your running app URL
+### Razorpay-live tests fail
+- `npm run test:razorpay` needs real, valid Razorpay Test Mode credentials in `.env`.
+- Two of the three (`SIG-001`, `REPLAY-001`) reference one specific real payment captured
+  during this project's own testing — they will only pass against the exact Razorpay
+  account that created it, not just any valid Test Mode account. This is expected and
+  documented in `docs/CI-CD.md` and inside the test file itself.
 
 ## Development Workflow
 
-1. **Make code changes** to `src/`
-2. **Run tests locally:**
-   ```bash
-   npm test
-   ```
-3. **Use UI mode for debugging:**
-   ```bash
-   npm run test:ui
-   ```
-4. **Commit and push** (CI runs tests automatically)
+1. Make code changes under `src/`
+2. Run the CI-safe suite locally: `npm run test:ci`
+3. Use `npm run test:ui` for interactive debugging
+4. Commit and push — GitHub Actions runs the CI-safe suite automatically on `main` and on pull requests
 
 ## Next Steps
 
-- Read [docs/RAZORPAY-GUIDE.md](docs/RAZORPAY-GUIDE.md) to set up Razorpay test credentials
-- Explore test examples in `tests/` (coming in Phase 2)
-- Check [README.md](README.md) for project overview
-
----
-
-**Need help?** Check the [FAQ section](#faq) or open an issue on GitHub.
+- Read [`docs/RAZORPAY-GUIDE.md`](docs/RAZORPAY-GUIDE.md) to set up your own Razorpay Test
+  Mode credentials
+- Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for how the app and its persistence/
+  state machine fit together
+- See [`README.md`](README.md) for the project overview, test summary, and known limitations
